@@ -31,6 +31,8 @@
 
 package io.grpc;
 
+import static io.grpc.ChannelImpl.TIMER_SERVICE;
+
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
 import com.google.common.util.concurrent.Futures;
@@ -47,7 +49,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -85,7 +86,7 @@ public final class ServerImpl extends Server {
   /** {@code transportServer} and services encapsulating something similar to a TCP connection. */
   private final Collection<ServerTransport> transports = new HashSet<ServerTransport>();
 
-  private final ScheduledExecutorService timeoutService;
+  private final ScheduledExecutorService timeoutService = SharedResourceHolder.get(TIMER_SERVICE);
 
   /**
    * Construct a server.
@@ -98,8 +99,6 @@ public final class ServerImpl extends Server {
     this.executor = Preconditions.checkNotNull(executor, "executor");
     this.registry = Preconditions.checkNotNull(registry, "registry");
     this.transportServer = Preconditions.checkNotNull(transportServer, "transportServer");
-    // TODO(carl-mastrangelo): replace this with the shared scheduler once PR #576 is merged.
-    this.timeoutService = Executors.newScheduledThreadPool(1);
   }
 
   /** Hack to allow executors to auto-shutdown. Not for general use. */
@@ -133,15 +132,23 @@ public final class ServerImpl extends Server {
    * Initiates an orderly shutdown in which preexisting calls continue but new calls are rejected.
    */
   public ServerImpl shutdown() {
+    boolean shutdownTransportServer;
     synchronized (lock) {
       if (shutdown) {
         return this;
       }
       shutdown = true;
-      transportServer.shutdown();
-      timeoutService.shutdown();
-      return this;
+      shutdownTransportServer = started;
+      if (!shutdownTransportServer) {
+        transportServerTerminated = true;
+        checkForTermination();
+      }
     }
+    if (shutdownTransportServer) {
+      transportServer.shutdown();
+    }
+    SharedResourceHolder.release(TIMER_SERVICE, timeoutService);
+    return this;
   }
 
   /**
@@ -153,10 +160,8 @@ public final class ServerImpl extends Server {
    */
   // TODO(ejona86): cancel preexisting calls.
   public ServerImpl shutdownNow() {
-    synchronized (lock) {
-      shutdown();
-      return this;
-    }
+    shutdown();
+    return this;
   }
 
   /**
@@ -177,7 +182,7 @@ public final class ServerImpl extends Server {
    *
    * @return whether the server is terminated, as would be done by {@link #isTerminated()}.
    */
-  public boolean awaitTerminated(long timeout, TimeUnit unit) throws InterruptedException {
+  public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
     synchronized (lock) {
       long timeoutNanos = unit.toNanos(timeout);
       long endTimeNanos = System.nanoTime() + timeoutNanos;
@@ -191,7 +196,7 @@ public final class ServerImpl extends Server {
   /**
    * Waits for the server to become terminated.
    */
-  public void awaitTerminated() throws InterruptedException {
+  public void awaitTermination() throws InterruptedException {
     synchronized (lock) {
       while (!terminated) {
         lock.wait();
@@ -254,12 +259,16 @@ public final class ServerImpl extends Server {
 
     @Override
     public void serverShutdown() {
+      ArrayList<ServerTransport> copiedTransports;
       synchronized (lock) {
         // transports collection can be modified during shutdown(), even if we hold the lock, due
         // to reentrancy.
-        for (ServerTransport transport : new ArrayList<ServerTransport>(transports)) {
-          transport.shutdown();
-        }
+        copiedTransports = new ArrayList<ServerTransport>(transports);
+      }
+      for (ServerTransport transport : copiedTransports) {
+        transport.shutdown();
+      }
+      synchronized (lock) {
         transportServerTerminated = true;
         checkForTermination();
       }
@@ -463,7 +472,7 @@ public final class ServerImpl extends Server {
     private volatile boolean cancelled;
     private boolean sendHeadersCalled;
     private boolean closeCalled;
-    private boolean sendPayloadCalled;
+    private boolean sendMessageCalled;
 
     public ServerCallImpl(ServerStream stream, MethodDescriptor<ReqT, RespT> method) {
       this.stream = stream;
@@ -479,18 +488,18 @@ public final class ServerImpl extends Server {
     public void sendHeaders(Metadata.Headers headers) {
       Preconditions.checkState(!sendHeadersCalled, "sendHeaders has already been called");
       Preconditions.checkState(!closeCalled, "call is closed");
-      Preconditions.checkState(!sendPayloadCalled, "sendPayload has already been called");
+      Preconditions.checkState(!sendMessageCalled, "sendMessage has already been called");
       sendHeadersCalled = true;
       stream.writeHeaders(headers);
     }
 
     @Override
-    public void sendPayload(RespT payload) {
+    public void sendMessage(RespT message) {
       Preconditions.checkState(!closeCalled, "call is closed");
-      sendPayloadCalled = true;
+      sendMessageCalled = true;
       try {
-        InputStream message = method.streamResponse(payload);
-        stream.writeMessage(message);
+        InputStream resp = method.streamResponse(message);
+        stream.writeMessage(resp);
         stream.flush();
       } catch (Throwable t) {
         close(Status.fromThrowable(t), new Metadata.Trailers());
@@ -540,7 +549,7 @@ public final class ServerImpl extends Server {
             return;
           }
 
-          listener.onPayload(method.parseRequest(message));
+          listener.onMessage(method.parseRequest(message));
         } finally {
           try {
             message.close();

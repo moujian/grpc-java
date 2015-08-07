@@ -116,6 +116,20 @@ public class ServerImplTest {
   }
 
   @Test
+  public void stopImmediate() {
+    transportServer = new SimpleServer() {
+      @Override
+      public void shutdown() {
+        throw new AssertionError("Should not be called, because wasn't started");
+      }
+    };
+    ServerImpl server = new ServerImpl(executor, registry, transportServer);
+    server.shutdown();
+    assertTrue(server.isShutdown());
+    assertTrue(server.isTerminated());
+  }
+
+  @Test
   public void startStopImmediateWithChildTransport() throws IOException {
     ServerImpl server = new ServerImpl(executor, registry, transportServer);
     server.start();
@@ -194,9 +208,9 @@ public class ServerImplTest {
 
     String order = "Lots of pizza, please";
     streamListener.messageRead(STRING_MARSHALLER.stream(order));
-    verify(callListener, timeout(2000)).onPayload(order);
+    verify(callListener, timeout(2000)).onMessage(order);
 
-    call.sendPayload(314);
+    call.sendMessage(314);
     ArgumentCaptor<InputStream> inputCaptor = ArgumentCaptor.forClass(InputStream.class);
     verify(stream).writeMessage(inputCaptor.capture());
     verify(stream).flush();
@@ -206,7 +220,7 @@ public class ServerImplTest {
     executeBarrier(executor).await();
     verify(callListener).onHalfClose();
 
-    call.sendPayload(50);
+    call.sendMessage(50);
     verify(stream, times(2)).writeMessage(inputCaptor.capture());
     verify(stream, times(2)).flush();
     assertEquals(50, INTEGER_MARSHALLER.parse(inputCaptor.getValue()).intValue());
@@ -252,6 +266,86 @@ public class ServerImplTest {
     executeBarrier(executor).await();
     verify(stream).close(same(status), notNull(Metadata.Trailers.class));
     verifyNoMoreInteractions(stream);
+  }
+
+  @Test
+  public void testNoDeadlockOnShutdown() throws Exception {
+    final Object lock = new Object();
+    final CyclicBarrier barrier = new CyclicBarrier(2);
+    class MaybeDeadlockingServer extends SimpleServer {
+      @Override
+      public void shutdown() {
+        // To deadlock, a lock would need to be held while this method is in progress.
+        try {
+          barrier.await();
+        } catch (Exception ex) {
+          throw new AssertionError(ex);
+        }
+        // If deadlock is possible with this setup, this sychronization completes the loop because
+        // the serverShutdown needs a lock that Server is holding while calling this method.
+        synchronized (lock) {
+        }
+      }
+    }
+
+    transportServer = new MaybeDeadlockingServer();
+    ServerImpl server = new ServerImpl(executor, registry, transportServer);
+    server.start();
+    new Thread() {
+      @Override
+      public void run() {
+        synchronized (lock) {
+          try {
+            barrier.await();
+          } catch (Exception ex) {
+            throw new AssertionError(ex);
+          }
+          // To deadlock, a lock would be needed for this call to proceed.
+          transportServer.listener.serverShutdown();
+        }
+      }
+    }.start();
+    server.shutdown();
+  }
+
+  @Test
+  public void testNoDeadlockOnTransportShutdown() throws Exception {
+    final Object lock = new Object();
+    final CyclicBarrier barrier = new CyclicBarrier(2);
+    class MaybeDeadlockingServerTransport extends SimpleServerTransport {
+      @Override
+      public void shutdown() {
+        // To deadlock, a lock would need to be held while this method is in progress.
+        try {
+          barrier.await();
+        } catch (Exception ex) {
+          throw new AssertionError(ex);
+        }
+        // If deadlock is possible with this setup, this sychronization completes the loop
+        // because the transportTerminated needs a lock that Server is holding while calling this
+        // method.
+        synchronized (lock) {
+        }
+      }
+    }
+
+    final ServerTransportListener transportListener
+        = transportServer.registerNewServerTransport(new MaybeDeadlockingServerTransport());
+    new Thread() {
+      @Override
+      public void run() {
+        synchronized (lock) {
+          try {
+            barrier.await();
+          } catch (Exception ex) {
+            throw new AssertionError(ex);
+          }
+          // To deadlock, a lock would be needed for this call to proceed.
+          transportListener.transportTerminated();
+        }
+      }
+    }.start();
+    server.shutdown();
   }
 
   /**

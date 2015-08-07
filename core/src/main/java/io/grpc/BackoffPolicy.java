@@ -32,56 +32,16 @@
 package io.grpc;
 
 /**
- * A {@link ServerCall.Listener} which forwards all of its methods to another {@link
- * ServerCall.Listener}.
+ * Determines how long to wait before doing some action (typically a retry, or a reconnect).
  */
-public abstract class ForwardingServerCallListener<ReqT> extends ServerCall.Listener<ReqT> {
-  /**
-   * Returns the delegated {@code ServerCall.Listener}.
-   */
-  protected abstract ServerCall.Listener<ReqT> delegate();
-
-  @Override
-  public void onMessage(ReqT message) {
-    delegate().onMessage(message);
-  }
-
-  @Override
-  public void onHalfClose() {
-    delegate().onHalfClose();
-  }
-
-  @Override
-  public void onCancel() {
-    delegate().onCancel();
-  }
-
-  @Override
-  public void onComplete() {
-    delegate().onComplete();
-  }
-
-  @Override
-  public void onReady() {
-    delegate().onReady();
+interface BackoffPolicy {
+  interface Provider {
+    BackoffPolicy get();
   }
 
   /**
-   * A simplified version of {@link ForwardingServerCallListener} where subclasses can pass in a
-   * {@link ServerCall.Listener} as the delegate.
+   * @return The number of milliseconds to wait.
    */
-  public abstract static class SimpleForwardingServerCallListener<ReqT>
-      extends ForwardingServerCallListener<ReqT> {
-
-    private final ServerCall.Listener<ReqT> delegate;
-
-    protected SimpleForwardingServerCallListener(ServerCall.Listener<ReqT> delegate) {
-      this.delegate = delegate;
-    }
-
-    @Override
-    protected ServerCall.Listener<ReqT> delegate() {
-      return delegate;
-    }
-  }
+  long nextBackoffMillis();
 }
+

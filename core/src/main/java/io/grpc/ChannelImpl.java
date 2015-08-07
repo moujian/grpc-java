@@ -35,6 +35,9 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
 import io.grpc.ClientCallImpl.ClientTransportProvider;
+import io.grpc.Metadata.Headers;
+import io.grpc.transport.ClientStream;
+import io.grpc.transport.ClientStreamListener;
 import io.grpc.transport.ClientTransport;
 import io.grpc.transport.ClientTransport.PingCallback;
 import io.grpc.transport.ClientTransportFactory;
@@ -67,7 +70,11 @@ public final class ChannelImpl extends Channel {
   /**
    * Executor that runs deadline timers for requests.
    */
-  private ScheduledExecutorService deadlineCancellationExecutor;
+  private ScheduledExecutorService scheduledExecutor;
+
+  // TODO(carl-mastrangelo): Allow clients to pass this in
+  private final BackoffPolicy.Provider backoffPolicyProvider =
+      new ExponentialBackoffPolicy.Provider();
   /**
    * We delegate to this channel, so that we can have interceptors as necessary. If there aren't
    * any interceptors this will just be {@link RealChannel}.
@@ -91,6 +98,9 @@ public final class ChannelImpl extends Channel {
   private boolean terminated;
   private Runnable terminationRunnable;
 
+  private long reconnectTimeMillis;
+  private BackoffPolicy reconnectPolicy;
+
   private final ClientTransportProvider transportProvider = new ClientTransportProvider() {
     @Override
     public ClientTransport get() {
@@ -104,7 +114,7 @@ public final class ChannelImpl extends Channel {
     this.executor = executor;
     this.userAgent = userAgent;
     this.interceptorChannel = ClientInterceptors.intercept(new RealChannel(), interceptors);
-    deadlineCancellationExecutor = SharedResourceHolder.get(TIMER_SERVICE);
+    scheduledExecutor = SharedResourceHolder.get(TIMER_SERVICE);
   }
 
   /** Hack to allow executors to auto-shutdown. Not for general use. */
@@ -118,16 +128,16 @@ public final class ChannelImpl extends Channel {
    * cancelled.
    */
   public ChannelImpl shutdown() {
+    ClientTransport savedActiveTransport;
     synchronized (lock) {
       if (shutdown) {
         return this;
       }
       shutdown = true;
       // After shutdown there are no new calls, so no new cancellation tasks are needed
-      deadlineCancellationExecutor =
-          SharedResourceHolder.release(TIMER_SERVICE, deadlineCancellationExecutor);
-      if (activeTransport != null) {
-        activeTransport.shutdown();
+      scheduledExecutor = SharedResourceHolder.release(TIMER_SERVICE, scheduledExecutor);
+      savedActiveTransport = activeTransport;
+      if (savedActiveTransport != null) {
         activeTransport = null;
       } else if (transports.isEmpty()) {
         terminated = true;
@@ -136,8 +146,11 @@ public final class ChannelImpl extends Channel {
           terminationRunnable.run();
         }
       }
-      return this;
     }
+    if (savedActiveTransport != null) {
+      savedActiveTransport.shutdown();
+    }
+    return this;
   }
 
   /**
@@ -149,10 +162,8 @@ public final class ChannelImpl extends Channel {
    */
   // TODO(ejona86): cancel preexisting calls.
   public ChannelImpl shutdownNow() {
-    synchronized (lock) {
-      shutdown();
-      return this;
-    }
+    shutdown();
+    return this;
   }
 
   /**
@@ -173,7 +184,7 @@ public final class ChannelImpl extends Channel {
    *
    * @return whether the channel is terminated, as would be done by {@link #isTerminated()}.
    */
-  public boolean awaitTerminated(long timeout, TimeUnit unit) throws InterruptedException {
+  public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
     synchronized (lock) {
       long timeoutNanos = unit.toNanos(timeout);
       long endTimeNanos = System.nanoTime() + timeoutNanos;
@@ -231,7 +242,8 @@ public final class ChannelImpl extends Channel {
 
   private ClientTransport obtainActiveTransport() {
     ClientTransport savedActiveTransport = activeTransport;
-    if (savedActiveTransport != null) {
+    // If we know there is an active transport and we are not in backoff mode, return quickly.
+    if (savedActiveTransport != null && !(savedActiveTransport instanceof InactiveTransport)) {
       return savedActiveTransport;
     }
     synchronized (lock) {
@@ -239,9 +251,22 @@ public final class ChannelImpl extends Channel {
         return null;
       }
       savedActiveTransport = activeTransport;
+      if (savedActiveTransport instanceof InactiveTransport) {
+        if (System.nanoTime() > TimeUnit.MILLISECONDS.toNanos(reconnectTimeMillis)) {
+          // The timeout expired, clear the inactive transport and update the shutdown status to
+          // something that is retryable.
+          activeTransport = null;
+          savedActiveTransport = activeTransport;
+        } else {
+          // We are still in backoff mode, just return the inactive transport.
+          return savedActiveTransport;
+        }
+      }
+
       if (savedActiveTransport != null) {
         return savedActiveTransport;
       }
+      // There is no active transport, or we just finished backoff.  Create a new transport.
       ClientTransport newActiveTransport = transportFactory.newClientTransport();
       transports.add(newActiveTransport);
       boolean failed = true;
@@ -273,7 +298,7 @@ public final class ChannelImpl extends Channel {
           new SerializingExecutor(executor),
           callOptions,
           transportProvider,
-          deadlineCancellationExecutor)
+          scheduledExecutor)
               .setUserAgent(userAgent);
     }
   }
@@ -287,15 +312,30 @@ public final class ChannelImpl extends Channel {
 
     @Override
     public void transportReady() {
-      // TODO(carl-mastrangelo): Implement this
+      synchronized (lock) {
+        if (activeTransport == transport) {
+          reconnectPolicy = null;
+        }
+      }
     }
 
     @Override
     public void transportShutdown(Status s) {
-      // TODO(carl-mastrangelo): use this status to determine if and how to retry the connection.
       synchronized (lock) {
         if (activeTransport == transport) {
           activeTransport = null;
+          // This transport listener was attached to the active transport.
+          if (s.isOk()) {
+            return;
+          }
+          // Alright, something bad has happened.
+          if (reconnectPolicy == null) {
+            // This happens the first time something bad has happened.
+            reconnectPolicy = backoffPolicyProvider.get();
+            reconnectTimeMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
+          }
+          activeTransport = new InactiveTransport(s);
+          reconnectTimeMillis += reconnectPolicy.nextBackoffMillis();
         }
       }
     }
@@ -308,7 +348,7 @@ public final class ChannelImpl extends Channel {
           activeTransport = null;
         }
         // TODO(notcarl): replace this with something more meaningful
-        transportShutdown(Status.UNKNOWN);
+        transportShutdown(Status.UNKNOWN.withDescription("transport shutdown for unknown reason"));
         transports.remove(transport);
         if (shutdown && transports.isEmpty()) {
           if (terminated) {
@@ -401,7 +441,7 @@ public final class ChannelImpl extends Channel {
     }
   }
 
-  private static final SharedResourceHolder.Resource<ScheduledExecutorService> TIMER_SERVICE =
+  static final SharedResourceHolder.Resource<ScheduledExecutorService> TIMER_SERVICE =
       new SharedResourceHolder.Resource<ScheduledExecutorService>() {
         @Override
         public ScheduledExecutorService create() {
@@ -420,4 +460,39 @@ public final class ChannelImpl extends Channel {
           instance.shutdown();
         }
       };
+
+  private static final class InactiveTransport implements ClientTransport {
+    private final Status shutdownStatus;
+
+    private InactiveTransport(Status s) {
+      shutdownStatus = s;
+    }
+
+    @Override
+    public ClientStream newStream(
+        MethodDescriptor<?, ?> method, Headers headers, ClientStreamListener listener) {
+      listener.closed(shutdownStatus, new Metadata.Trailers());
+      return new ClientCallImpl.NoopClientStream();
+    }
+
+    @Override
+    public void start(Listener listener) {
+      throw new IllegalStateException();
+    }
+
+    @Override
+    public void ping(final PingCallback callback, Executor executor) {
+      executor.execute(new Runnable() {
+        @Override
+        public void run() {
+          callback.pingFailed(shutdownStatus.asException());
+        }
+      });
+    }
+
+    @Override
+    public void shutdown() {
+      // no-op
+    }
+  }
 }

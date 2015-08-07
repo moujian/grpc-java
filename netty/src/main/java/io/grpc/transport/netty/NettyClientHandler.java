@@ -44,6 +44,7 @@ import io.grpc.transport.ClientTransport.PingCallback;
 import io.grpc.transport.Http2Ping;
 import io.grpc.transport.HttpUtil;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
@@ -75,6 +76,11 @@ import javax.annotation.Nullable;
  */
 class NettyClientHandler extends Http2ConnectionHandler {
   private static final Logger logger = Logger.getLogger(NettyClientHandler.class.getName());
+  /**
+   * A message that simply passes through the channel without any real processing. It is useful to
+   * check if buffers have been drained and test the health of the channel in a single operation.
+   */
+  static final Object NOOP_MESSAGE = new Object();
 
   private final Http2Connection.PropertyKey streamKey;
   private final Ticker ticker;
@@ -160,6 +166,8 @@ class NettyClientHandler extends Http2ConnectionHandler {
       ((RequestMessagesCommand) msg).requestMessages();
     } else if (msg instanceof SendPingCommand) {
       sendPingFrame(ctx, (SendPingCommand) msg, promise);
+    } else if (msg == NOOP_MESSAGE) {
+      ctx.write(Unpooled.EMPTY_BUFFER, promise);
     } else {
       throw new AssertionError("Write called for unexpected type: " + msg.getClass().getName());
     }
@@ -205,11 +213,10 @@ class NettyClientHandler extends Http2ConnectionHandler {
   /**
    * Handler for an inbound HTTP/2 RST_STREAM frame, terminating a stream.
    */
-  private void onRstStreamRead(int streamId)
-      throws Http2Exception {
-    // TODO(nmittler): do something with errorCode?
+  private void onRstStreamRead(int streamId, long errorCode) throws Http2Exception {
     NettyClientStream stream = clientStream(requireHttp2Stream(streamId));
-    stream.transportReportStatus(Status.UNKNOWN, false, new Metadata.Trailers());
+    Status status = HttpUtil.Http2Error.statusForCode((int) errorCode);
+    stream.transportReportStatus(status, false, new Metadata.Trailers());
   }
 
   @Override
@@ -524,7 +531,7 @@ class NettyClientHandler extends Http2ConnectionHandler {
     @Override
     public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode)
         throws Http2Exception {
-      handler.onRstStreamRead(streamId);
+      handler.onRstStreamRead(streamId, errorCode);
     }
 
     @Override public void onPingAckRead(ChannelHandlerContext ctx, ByteBuf data)

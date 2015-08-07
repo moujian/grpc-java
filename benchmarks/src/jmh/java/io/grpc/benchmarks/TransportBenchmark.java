@@ -120,7 +120,8 @@ public class TransportBenchmark {
         int port = pickUnusedPort();
         InetSocketAddress address = new InetSocketAddress("localhost", port);
         serverBuilder = NettyServerBuilder.forAddress(address);
-        channelBuilder = OkHttpChannelBuilder.forAddress("localhost", port);
+        channelBuilder = OkHttpChannelBuilder.forAddress("localhost", port)
+            .negotiationType(io.grpc.transport.okhttp.NegotiationType.PLAINTEXT);
         break;
       }
       default:
@@ -146,8 +147,8 @@ public class TransportBenchmark {
   public void tearDown() throws Exception {
     channel.shutdown();
     server.shutdown();
-    channel.awaitTerminated(1, TimeUnit.SECONDS);
-    server.awaitTerminated(1, TimeUnit.SECONDS);
+    channel.awaitTermination(1, TimeUnit.SECONDS);
+    server.awaitTermination(1, TimeUnit.SECONDS);
     if (!channel.isTerminated()) {
       throw new Exception("failed to shut down channel");
     }

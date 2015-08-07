@@ -31,57 +31,44 @@
 
 package io.grpc;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+
+import java.util.Random;
+
 /**
- * A {@link ServerCall.Listener} which forwards all of its methods to another {@link
- * ServerCall.Listener}.
+ * Test for {@link ExponentialBackoffPolicy}.
  */
-public abstract class ForwardingServerCallListener<ReqT> extends ServerCall.Listener<ReqT> {
-  /**
-   * Returns the delegated {@code ServerCall.Listener}.
-   */
-  protected abstract ServerCall.Listener<ReqT> delegate();
-
-  @Override
-  public void onMessage(ReqT message) {
-    delegate().onMessage(message);
-  }
-
-  @Override
-  public void onHalfClose() {
-    delegate().onHalfClose();
-  }
-
-  @Override
-  public void onCancel() {
-    delegate().onCancel();
-  }
-
-  @Override
-  public void onComplete() {
-    delegate().onComplete();
-  }
-
-  @Override
-  public void onReady() {
-    delegate().onReady();
-  }
-
-  /**
-   * A simplified version of {@link ForwardingServerCallListener} where subclasses can pass in a
-   * {@link ServerCall.Listener} as the delegate.
-   */
-  public abstract static class SimpleForwardingServerCallListener<ReqT>
-      extends ForwardingServerCallListener<ReqT> {
-
-    private final ServerCall.Listener<ReqT> delegate;
-
-    protected SimpleForwardingServerCallListener(ServerCall.Listener<ReqT> delegate) {
-      this.delegate = delegate;
-    }
-
+@RunWith(JUnit4.class)
+public class ExponentialBackoffPolicyTest {
+  private ExponentialBackoffPolicy policy = new ExponentialBackoffPolicy();
+  private Random notRandom = new Random() {
     @Override
-    protected ServerCall.Listener<ReqT> delegate() {
-      return delegate;
+    public double nextDouble() {
+      return .5;
     }
+  };
+
+  @Test
+  public void maxDelayReached() {
+    long maxBackoffMillis = 120 * 1000;
+    policy.setMaxBackoffMillis(maxBackoffMillis)
+        .setJitter(0)
+        .setRandom(notRandom);
+    for (int i = 0; i < 50; i++) {
+      if (maxBackoffMillis == policy.nextBackoffMillis()) {
+        return; // Success
+      }
+    }
+    assertEquals("max delay not reached", maxBackoffMillis, policy.nextBackoffMillis());
+  }
+
+  @Test public void canProvide() {
+    assertNotNull(new ExponentialBackoffPolicy.Provider().get());
   }
 }
+
